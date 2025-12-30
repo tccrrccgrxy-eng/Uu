@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>التقويم الذكي - Smart Calendar</title>
+
+  <!-- Google Font: Tajawal -->
+  <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800&display=swap" rel="stylesheet">
+
+  <!-- Tailwind Play CDN (no build required) -->
+  <script>
+    // Tailwind configuration: extend font, colors, rounded
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            tajawal: ['Tajawal', 'sans-serif']
+          },
+          colors: {
+            indigo: {
+              700: '#4f46e5',
+              600: '#5b21b6'
+            },
+            slate: {
+              700: '#334155',
+              500: '#64748b'
+            }
+          },
+          borderRadius: {
+            '3xl': '1.5rem'
+          }
+        }
+      }
+    }
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- React + ReactDOM UMD -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <!-- Babel for in-browser JSX transpile (ok for demo / GH Pages) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- date-fns UMD -->
+  <script src="https://unpkg.com/date-fns@2.30.0/dist/date-fns.min.js"></script>
+
+  <style>
+    html, body, #root { height: 100%; }
+    body {
+      font-family: 'Tajawal', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      background: linear-gradient(180deg, #fcfdff 0%, #f8fafc 100%);
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* Simple material-like shadow */
+    .md-surface {
+      background: white;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.08);
+    }
+
+    /* Loading spinner */
+    .spinner {
+      border: 4px solid rgba(0,0,0,0.06);
+      border-top-color: rgba(79,70,229,1);
+      border-radius: 9999px;
+      width: 56px;
+      height: 56px;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* small helper for truncated text in Arabic RTL */
+    .truncate-rtl { text-overflow: ellipsis; overflow: hidden; white-space: nowrap; direction: rtl; }
+  </style>
+</head>
+<body class="antialiased">
+
+<div id="root" class="h-full"></div>
+
+<!-- Main app script (JSX) -->
+<script type="text/babel">
+
+const { useState, useEffect, useMemo } = React;
+const dfns = dateFns; // alias to date-fns UMD
+
+/* ---------- Arabic labels and helpers ---------- */
+const AR_MONTHS = ['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
+const AR_WEEKDAYS = ['أحد','اثن','ثلث','أربع','خمس','جمع','سبت']; // short forms
+const defaultCategories = [
+  { id: 'work', name: 'عمل', color: 'bg-indigo-600' },
+  { id: 'personal', name: 'شخصي', color: 'bg-slate-500' },
+  { id: 'health', name: 'صحة', color: 'bg-rose-500' }
+];
+
+function formatArabicDate(date) {
+  const d = dfns.getDate(date);
+  const month = AR_MONTHS[dfns.getMonth(date)];
+  const year = dfns.getYear(date);
+  return `${d} ${month} ${year}`;
+}
+
+/* ---------- LocalStorage helpers ---------- */
+const STORAGE_KEY = 'smartCalendar_v1';
+function loadStore() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch(e) { console.error(e); return null; }
+}
+function saveStore(state) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch(e) { console.error('Failed to save', e); }
+}
+
+/* ---------- Utility helpers ---------- */
+function uid(prefix='id') { return prefix + '_' + Date.now() + '_' + Math.floor(Math.random()*9999); }
+
+// Ensure time string like "09:30"
+function normalizeTime(t) {
+  if (!t) return '';
+  const parts = t.split(':');
+  if (parts.length === 1) return parts[0].padStart(2,'0') + ':00';
+  return parts[0].padStart(2,'0') + ':' + parts[1].padStart(2,'0');
+}
+
+/* Determine if a task applies to a given date considering repeats */
+function taskAppliesOn(task, date) {
+  const taskStartDate = dfns.parseISO(task.startDate); // stored as ISO yyyy-mm-dd
+  const target = dfns.startOfDay(date);
+  if (dfns.isAfter(taskStartDate, target)) return false;
+  if (task.repeat === 'none') {
+    return dfns.isEqual(taskStartDate, target);
+  }
+  if (task.repeat === 'daily') {
+    // starts on startDate and continues daily
+    return !dfns.isAfter(taskStartDate, target);
+  }
+  if (task.repeat === 'weekly') {
+    // if weekday matches and not before startDate
+    return dfns.getDay(taskStartDate) === dfns.getDay(target) && !dfns.isAfter(taskStartDate, target);
+  }
+  return false;
+}
+
+/* ---------- Main App ---------- */
+function App(){
+  // loading spinner for first paint / simulate font loading
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    const t = setTimeout(() => setLoading(false), 600);
+    return () => clearTimeout(t);
+  }, []);
+
+  // app state persisted in localStorage
+  const [store, setStore] = useState(() => {
+    const saved = loadStore();
+    if (saved) return saved;
+    // default initial state
+    const todayISO = dfns.formatISO(dfns.startOfDay(new Date()), { representation: 'date' });
+    return {
+      tasks: [
+        // sample task
+        {
+          id: uid('task'),
+          title: 'موعد اجتماع',
+          startDate: todayISO,
+          startTime: '10:00',
+          endTime: '11:00',
+          category: 'work',
+          repeat: 'none',
+          createdAt: new Date().toISOString()
+        }
+      ],
+      notes: {
+        // "yyyy-mm-dd": { text, mood }
+      },
+      categories: defaultCategories
+    };
+  });
+
+  useEffect(() => saveStore(store), [store]);
+
+  const [currentView, setCurrentView] = useState('calendar'); // calendar | tasks | notes
+  const [cursorMonth, setCursorMonth] = useState(dfns.startOfMonth(new Date()));
+  const [selectedDate, setSelectedDate] = useState(dfns.startOfDay(new Date()));
+
+  // derived: tasks for selectedDate (including repeats)
+  const tasksForSelected = useMemo(() => {
+    return store.tasks.filter(t => taskAppliesOn(t, selectedDate))
+      .sort((a,b) => {
+        const ta = normalizeTime(a.startTime || '00:00');
+        const tb = normalizeTime(b.startTime || '00:00');
+        return ta.localeCompare(tb);
+      });
+  }, [store.tasks, selectedDate]);
+
+  // notes for selectedDate
+  const selectedISO = dfns.formatISO(selectedDate, { representation: 'date' });
+  const noteForSelected = store.notes[selectedISO] || { text: '', mood: '' };
+
+  /* ---------- CRUD actions ---------- */
+  function addTask(payload) {
+    const newTask = {
+      id: uid('task'),
+      title: payload.title || 'مهمة جديدة',
+      startDate: payload.startDate || selectedISO,
+      startTime: normalizeTime(payload.startTime || '09:00'),
+      endTime: normalizeTime(payload.endTime || ''),
+      category: payload.category || 'personal',
+      repeat: payload.repeat || 'none',
+      createdAt: new Date().toISOString()
+    };
+    setStore(s => ({ ...s, tasks: [...s.tasks, newTask] }));
+    setCurrentView('tasks');
+  }
+
+  function updateTask(id, changes) {
+    setStore(s => ({ ...s, tasks: s.tasks.map(t => t.id === id ? { ...t, ...changes } : t) }));
+  }
+
+  function removeTask(id) {
+    if (!confirm('هل تريد حذف هذه المهمة؟')) return;
+    setStore(s => ({ ...s, tasks: s.tasks.filter(t => t.id !== id) }));
+  }
+
+  function saveNote(text, mood) {
+    setStore(s => {
+      const notes = { ...s.notes };
+      if (!text && !mood) {
+        delete notes[selectedISO];
+      } else {
+        notes[selectedISO] = { text, mood };
+      }
+      return { ...s, notes };
+    });
+    alert('تم حفظ الملاحظة');
+  }
+
+  /* ---------- UI layout ---------- */
+  return (
+    <div className="min-h-screen flex flex-col max-w-3xl mx-auto p-4">
+      {loading ? (
+        <div className="flex-1 flex items-center justify-center">
+          <div className="flex flex-col items-center gap-4">
+            <div className="spinner" role="status" aria-label="جارٍ التحميل"></div>
+            <div className="text-slate-500">جاري التحميل...</div>
+          </div>
+        </div>
+      ) : (
+      <>
+        <header className="flex items-center justify-between mb-4">
+          <div>
+            <h1 className="text-2xl font-semibold text-slate-800">التقويم الذكي</h1>
+            <div className="text-sm text-slate-500 mt-1">{formatArabicDate(selectedDate)}</div>
+          </div>
+          <div className="flex items-center gap-3">
+            <button onClick={() => { setSelectedDate(dfns.startOfDay(new Date())); setCursorMonth(dfns.startOfMonth(new Date())); }} className="px-3 py-2 rounded-3xl bg-indigo-600 text-white text-sm">اليوم</button>
+            <div className="text-sm text-slate-500">عرض: <span className="font-medium text-slate-700 capitalize">{currentView === 'calendar' ? 'التقويم' : currentView === 'tasks' ? 'المهام' : 'المذكرات'}</span></div>
+          </div>
+        </header>
+
+        <main className="flex-1 space-y-4">
+          {currentView === 'calendar' && (
+            <div className="md-surface rounded-3xl p-4">
+              <MonthView
+                cursorMonth={cursorMonth}
+                onChangeMonth={m => setCursorMonth(m)}
+                selectedDate={selectedDate}
+                onSelectDate={d => { setSelectedDate(d); setCurrentView('tasks'); }}
+                today={dfns.startOfDay(new Date())}
+              />
+            </div>
+          )}
+
+          {currentView === 'tasks' && (
+            <div className="md-surface rounded-3xl p-4">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-lg font-medium">قائمة يوم {dfns.format(selectedDate, 'dd/MM/yyyy')}</h2>
+                <div className="flex items-center gap-2">
+                  <button onClick={() => setSelectedDate(dfns.addDays(selectedDate, -1))} className="px-3 py-1 rounded-lg bg-slate-100 text-slate-700">السابق</button>
+                  <button onClick={() => setSelectedDate(dfns.addDays(selectedDate, 1))} className="px-3 py-1 rounded-lg bg-slate-100 text-slate-700">التالي</button>
+                </div>
+              </div>
+
+              <Timeline tasks={tasksForSelected} onEdit={updateTask} onDelete={removeTask} />
+
+              <div className="mt-4">
+                <TaskForm selectedDate={selectedDate} categories={store.categories} onAdd={addTask} />
+              </div>
+            </div>
+          )}
+
+          {currentView === 'notes' && (
+            <div className="md-surface rounded-3xl p-4">
+              <NotesPanel note={noteForSelected} date={selectedDate} onSave={saveNote} />
+            </div>
+          )}
+        </main>
+
+        <nav className="fixed bottom-4 left-1/2 -translate-x-1/2 w-[92%] max-w-3xl md:relative md:bottom-auto md:left-auto md:transform-none md:w-full">
+          <div className="md-surface flex justify-between items-center p-3 rounded-3xl">
+            <button onClick={() => setCurrentView('calendar')} className={`flex-1 py-2 px-3 rounded-2xl ${currentView==='calendar' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600'}`}>
+              <div className="text-center text-sm font-medium">التقويم</div>
+            </button>
+            <button onClick={() => setCurrentView('tasks')} className={`flex-1 py-2 px-3 rounded-2xl ${currentView==='tasks' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600'}`}>
+              <div className="text-center text-sm font-medium">المهام</div>
+            </button>
+            <button onClick={() => setCurrentView('notes')} className={`flex-1 py-2 px-3 rounded-2xl ${currentView==='notes' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600'}`}>
+              <div className="text-center text-sm font-medium">المذكرات</div>
+            </button>
+          </div>
+        </nav>
+      </>
+      )}
+    </div>
+  );
+}
+
+/* ---------- MonthView: monthly calendar grid ---------- */
+function MonthView({ cursorMonth, onChangeMonth, selectedDate, onSelectDate, today }) {
+  // compute month matrix
+  const start = dfns.startOfWeek(dfns.startOfMonth(cursorMonth), { weekStartsOn: 6 }); // weekStartsOn:6 (Saturday) but for Arabic typically Saturday start; adjust to Sunday? We'll keep Saturday(6).
+  // However AR common week start is Saturday or Sunday; using Saturday for right-to-left reading.
+  const weeks = [];
+  let day = start;
+  for (let w=0; w<6; w++) {
+    const days = [];
+    for (let i=0; i<7; i++) {
+      days.push(day);
+      day = dfns.addDays(day, 1);
+    }
+    weeks.push(days);
+  }
+
+  function prevMonth() { onChangeMonth(dfns.subMonths(cursorMonth, 1)); }
+  function nextMonth() { onChangeMonth(dfns.addMonths(cursorMonth, 1)); }
+
+  return (
+    <>
+      <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center gap-3">
+          <button onClick={prevMonth} className="p-2 rounded-full hover:bg-slate-100"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" /></svg></button>
+          <div>
+            <div className="text-base font-semibold">{AR_MONTHS[dfns.getMonth(cursorMonth)]} {dfns.getYear(cursorMonth)}</div>
+            <div className="text-sm text-slate-500">{dfns.format(cursorMonth, 'EEEE', {locale: undefined})}</div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={() => { onChangeMonth(dfns.startOfMonth(new Date())); }} className="px-3 py-1 rounded-3xl bg-indigo-600 text-white text-sm">هذا الشهر</button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-7 gap-2 text-center mb-2">
+        {AR_WEEKDAYS.map((d,i) => <div key={i} className="text-xs font-medium text-slate-500">{d}</div>)}
+      </div>
+
+      <div className="grid grid-rows-6 gap-2">
+        {weeks.map((week,wi) => (
+          <div key={wi} className="grid grid-cols-7 gap-2">
+            {week.map((dayItem, di) => {
+              const dayNum = dfns.getDate(dayItem);
+              const inMonth = dfns.getMonth(dayItem) === dfns.getMonth(cursorMonth);
+              const isToday = dfns.isEqual(dfns.startOfDay(dayItem), today);
+              const isSelected = dfns.isEqual(dfns.startOfDay(dayItem), selectedDate);
+              return (
+                <button key={di} onClick={() => onSelectDate(dfns.startOfDay(dayItem))}
+                  className={`p-2 rounded-2xl text-right ${inMonth ? 'bg-white' : 'bg-slate-50 text-slate-400'} ${isSelected ? 'ring-2 ring-indigo-300' : ''} ${isToday ? 'border border-indigo-200' : ''}`}>
+                  <div className="flex items-center justify-between">
+                    <span className={`text-sm font-medium ${isSelected ? 'text-indigo-700' : 'text-slate-700'}`}>{dayNum}</span>
+                    {/* small indicator for events (vanilla): */}
+                    <span className={`w-2 h-2 rounded-full ${inMonth ? 'bg-indigo-300/0' : ''} ${isToday ? 'bg-indigo-500' : ''}`} />
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/* ---------- Timeline for tasks ---------- */
+function Timeline({ tasks, onEdit, onDelete }) {
+  if (!tasks.length) {
+    return <div className="py-8 text-center text-slate-500">لا توجد مهام لهذا اليوم</div>;
+  }
+  return (
+    <div className="space-y-3">
+      {tasks.map(t => (
+        <div key={t.id} className="flex items-center gap-3 p-3 rounded-2xl border border-slate-100">
+          <div className="w-14 flex flex-col items-center text-xs text-slate-500">
+            <div className="font-medium text-slate-700">{t.startTime || '--'}</div>
+            <div className="text-xs">{t.endTime || ''}</div>
+          </div>
+          <div className="flex-1">
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-medium text-slate-800">{t.title}</div>
+              <div className="text-xs text-slate-500">{t.repeat === 'none' ? '' : (t.repeat === 'daily' ? 'يومي' : 'أسبوعي')}</div>
+            </div>
+            <div className="text-xs text-slate-500 mt-1 flex items-center gap-2">
+              <span className="px-2 py-1 rounded-lg bg-slate-100 text-slate-600">{t.category}</span>
+              <span className="text-slate-400">•</span>
+              <span className="text-xs">{dfns.format(dfns.parseISO(t.createdAt), 'dd/MM/yyyy')}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button title="تعديل" onClick={() => {
+              const newTitle = prompt('عدل عنوان المهمة:', t.title);
+              if (newTitle !== null) onEdit(t.id, { title: newTitle });
+            }} className="p-2 rounded-md hover:bg-slate-100"><svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-slate-600" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5h6M4 7h2m3 0h2M4 11h16M4 15h10m-6 4h6" /></svg></button>
+            <button title="حذف" onClick={() => onDelete(t.id)} className="p-2 rounded-md hover:bg-slate-100 text-rose-500">
+              <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M20 7L4 7M10 11v6M14 11v6M6 7l1 12a2 2 0 002 2h6a2 2 0 002-2l1-12" /></svg>
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------- Task Form ---------- */
+function TaskForm({ selectedDate, categories, onAdd }) {
+  const [title, setTitle] = useState('');
+  const [startTime, setStartTime] = useState('09:00');
+  const [endTime, setEndTime] = useState('');
+  const [category, setCategory] = useState(categories[0]?.id || 'personal');
+  const [repeat, setRepeat] = useState('none');
+  const iso = dfns.formatISO(selectedDate, { representation: 'date' });
+
+  function submit(e) {
+    e.preventDefault();
+    if (!title.trim()) { alert('أدخل عنوان المهمة'); return; }
+    onAdd({ title, startDate: iso, startTime, endTime, category, repeat });
+    setTitle(''); setStartTime('09:00'); setEndTime(''); setRepeat('none');
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3">
+      <div className="grid grid-cols-1 gap-2">
+        <input value={title} onChange={e=>setTitle(e.target.value)} placeholder="عنوان المهمة" className="w-full p-3 rounded-2xl border border-slate-100 focus:outline-none" />
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <input type="time" value={startTime} onChange={e=>setStartTime(e.target.value)} className="p-2 rounded-2xl border border-slate-100" />
+        <input type="time" value={endTime} onChange={e=>setEndTime(e.target.value)} className="p-2 rounded-2xl border border-slate-100" />
+      </div>
+      <div className="grid grid-cols-3 gap-2">
+        <select value={category} onChange={e=>setCategory(e.target.value)} className="p-2 rounded-2xl border border-slate-100">
+          {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+        </select>
+        <select value={repeat} onChange={e=>setRepeat(e.target.value)} className="p-2 rounded-2xl border border-slate-100">
+          <option value="none">بدون تكرار</option>
+          <option value="daily">يومي</option>
+          <option value="weekly">أسبوعي</option>
+        </select>
+        <div className="text-sm text-slate-500 p-2">تاريخ: <span className="font-medium">{dfns.format(selectedDate, 'dd/MM')}</span></div>
+      </div>
+      <div className="flex items-center gap-2">
+        <button type="submit" className="px-4 py-2 rounded-3xl bg-indigo-600 text-white">إضافة مهمة</button>
+        <button type="button" onClick={() => { setTitle(''); setStartTime('09:00'); setEndTime(''); setRepeat('none'); }} className="px-3 py-2 rounded-3xl bg-slate-100">إلغاء</button>
+      </div>
+    </form>
+  );
+}
+
+/* ---------- Notes & Mood panel ---------- */
+function NotesPanel({ note, date, onSave }) {
+  const [text, setText] = useState(note.text || '');
+  const [mood, setMood] = useState(note.mood || '');
+
+  useEffect(() => {
+    setText(note.text || '');
+    setMood(note.mood || '');
+  }, [note]);
+
+  const moods = ['😊','🙂','😐','😔','😡','🎉'];
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-lg font-medium">مذكرة ليوم {dfns.format(date, 'dd/MM/yyyy')}</h3>
+        <div className="text-sm text-slate-500">{formatArabicDate(date)}</div>
+      </div>
+
+      <textarea value={text} onChange={e=>setText(e.target.value)} rows="6" className="w-full p-3 rounded-2xl border border-slate-100 focus:outline-none" placeholder="اكتب ملاحظاتك هنا..."></textarea>
+
+      <div className="flex items-center gap-3">
+        <div className="text-sm">اختر المزاج:</div>
+        <div className="flex items-center gap-2">
+          {moods.map(m => (
+            <button key={m} onClick={() => setMood(m)} className={`p-2 rounded-xl text-lg ${mood===m ? 'bg-indigo-100' : 'bg-slate-50'}`}>{m}</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <button onClick={() => onSave(text, mood)} className="px-4 py-2 rounded-3xl bg-indigo-600 text-white">حفظ</button>
+        <button onClick={() => { setText(''); setMood(''); onSave('', ''); }} className="px-3 py-2 rounded-3xl bg-slate-100">مسح</button>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- Render ---------- */
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+</script>
+
+</body>
+</html>
